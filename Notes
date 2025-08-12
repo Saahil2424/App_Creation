@@ -580,6 +580,82 @@ Pipeline Stages
 	8.	Post-Deployment Health Check
 	9.	Notify Slack/SNS
 
+Correct — the earlier code I gave you for fetching RDS credentials from Secrets Manager did not include SSM (AWS Systems Manager) commands.
+We were directly fetching credentials from Secrets Manager in the Python app via boto3.
+If you want to follow organisation-wide best practices, then we can enhance the solution to use AWS SSM Parameter Store (especially SecureString parameters) along with ECS task roles. This approach is widely used because:
+	•	You can store non-rotating config values (e.g., DB host, port) in Parameter Store.
+	•	You can store rotating secrets (passwords, tokens) in Secrets Manager.
+	•	You can combine both in your app so credentials are never hardcoded or passed manually.
+⸻
+Updated App Flow with SSM
+	1.	RDS Credentials → stored in Secrets Manager.
+	2.	DB Host, DB Name, Port, App Configs → stored in SSM Parameter Store.
+	3.	ECS Task Role → attached with policies:
+	•	secretsmanager:GetSecretValue
+	•	ssm:GetParameter & ssm:GetParameters
+	4.	Python app:
+	•	Fetch DB Host, Port from SSM.
+	•	Fetch DB Username/Password from Secrets Manager.
+	•	Use both to connect to RDS.
+Example IAM Policy for ECS Task Role :
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "ssm:GetParameter",
+        "ssm:GetParameters"
+      ],
+      "Resource": "arn:aws:ssm:ap-south-1:123456789012:parameter/my-app/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "secretsmanager:GetSecretValue",
+      "Resource": "arn:aws:secretsmanager:ap-south-1:123456789012:secret:my-rds-credentials-*"
+    }
+  ]
+}
+
+Example Python Code for ECS Container:
+import boto3
+import json
+import psycopg2
+
+# Create AWS clients
+ssm_client = boto3.client('ssm', region_name='ap-south-1')
+secrets_client = boto3.client('secretsmanager', region_name='ap-south-1')
+
+# Get DB config from SSM Parameter Store
+db_host = ssm_client.get_parameter(Name='/my-app/db-host', WithDecryption=True)['Parameter']['Value']
+db_port = ssm_client.get_parameter(Name='/my-app/db-port', WithDecryption=True)['Parameter']['Value']
+db_name = ssm_client.get_parameter(Name='/my-app/db-name', WithDecryption=True)['Parameter']['Value']
+
+# Get DB credentials from Secrets Manager
+secret_value = secrets_client.get_secret_value(SecretId='my-rds-credentials')
+secret_dict = json.loads(secret_value['SecretString'])
+db_user = secret_dict['username']
+db_password = secret_dict['password']
+
+# Connect to RDS
+conn = psycopg2.connect(
+    host=db_host,
+    port=db_port,
+    dbname=db_name,
+    user=db_user,
+    password=db_password
+)
+
+print("Connected to RDS successfully!")
+
+Advantages of This Approach
+
+✅ No hardcoded credentials in code or environment variables.
+✅ Can rotate passwords in Secrets Manager without code changes.
+✅ Can update DB host (e.g., after failover) in SSM without redeploying.
+✅ ECS scaling works without extra configuration — all tasks use the same IAM role to fetch credentials/config.
+
+
 
 
 
