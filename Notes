@@ -6,6 +6,31 @@ app-only deployment package you can drop into your repo and run from Jenkins (no
 	•	required IAM permissions / notes
 	•	step‑by‑step config / run checklist and interview-ready talking points
 
+
+High-Level Flow
+	1.	Jenkins → Triggered manually with parameters (aws_environment, region, action=create/update)
+	2.	Checkout Code from GitHub (Dockerfile + app code + Jenkinsfile)
+	3.	Build Docker Image → Tag it with commit SHA & latest
+	4.	Push to ECR
+	5.	Find ECS Cluster by pattern (my-ecscluster-*) → Pick the right one
+	6.	Register New ECS Task Definition with IAM role, Secrets Manager, RDS access
+	7.	Create/Update ECS Service with new task definition
+	8.	Verify Health → If failure → Rollback to last known good image
+	9.	Enable CloudWatch Logs for application container
+	10.	IAM Role on task → App fetches RDS creds from Secrets Manager automatically
+
+⸻
+
+Tools & Integrations
+	•	AWS CLI (for cluster search, task definition updates, service deployment, rollbacks)
+	•	Jenkins (pipeline orchestration)
+	•	ECR (store Docker images)
+	•	ECS (Fargate/EC2) (run containers)
+	•	AWS Secrets Manager (store RDS credentials)
+	•	IAM Roles for Tasks (secure credentials access)
+	•	CloudWatch Logs (collect app + ECS logs)
+
+
 Use this as your app pipeline (infra is assumed created by the infra pipeline).
 
 ⸻
