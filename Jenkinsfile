@@ -2,215 +2,145 @@ pipeline {
   agent any
 
   environment {
-    ECR_REPO = ''
-    ECS_CLUSTER = 'my-ecs-cluster'
-    SERVICE_X = 'my-ecs-service-x'
-    SERVICE_Y = 'my-ecs-service-y'
-    TASK_DEF_TEMPLATE = 'ecs-task-def.json'
-    TASK_DEF_FILE = 'ecs-task-def-updated.json'
-    IMAGE_TAG = ''
-    SECRET_ID = 'my/secret/id'            // <-- update to your secret name or ARN
+    TASK_DEF_TEMPLATE = 'definitions/ecs-task-def.json'
+    TASK_DEF_FILE     = 'definitions/ecs-task-def-updated.json'
+    CLUSTER_PREFIX    = 'my-ecscluster-'    // infra-created cluster name prefix
+    SERVICE_NAME      = 'my-app-service'    // ECS service name (same across x/y clusters)
+    DDB_TABLE         = 'DeployState'       // DynamoDB table to record lastKnownGood
   }
 
   parameters {
-    choice(name: 'AWS_ACCOUNT', choices: ['dev', 'stage', 'prod'], description: 'Select AWS Account')
-    choice(name: 'AWS_REGION', choices: ['us-east-1', 'us-west-2', 'eu-west-1'], description: 'Select AWS Region')
-    choice(name: 'ENVIRONMENT', choices: ['x', 'y'], description: 'Select environment')
-    string(name: 'AWS_CREDS', defaultValue: '', description: 'Optional Jenkins AWS credentialId (leave blank to use instance profile)')
+    choice(name: 'AWS_ACCOUNT', choices: ['dev','prod'], description: 'env (infra account)')
+    choice(name: 'AWS_REGION', choices: ['ap-south-1','us-east-1'], description: 'AWS region')
+    choice(name: 'ACTION', choices: ['create','update'], description: 'create or update service')
+    string(name: 'AWS_CREDS', defaultValue: '', description: 'Optional Jenkins AWS credentialsId; leave blank to use instance profile')
+    string(name: 'ECR_REPO_URI', defaultValue: '', description: 'Optional: full ECR repo URI override')
+    string(name: 'HEALTH_URL', defaultValue: '', description: 'ALB/health URL for smoke test (if empty, smoke test is skipped)')
+    booleanParam(name: 'WAIT_FOR_STEADY', defaultValue: true, description: 'Wait for ECS service to stabilize before smoke test')
   }
 
   stages {
-    stage('Set AWS Config & ECR Repo') {
+    stage('Checkout') { steps { checkout scm } }
+
+    stage('Discover ECS Cluster') {
       steps {
         script {
-          if (params.AWS_ACCOUNT == 'dev') {
-            env.ECR_REPO = '12345.dkr.ecr.us-east-1.amazonaws.com/my-app'
-          } else if (params.AWS_ACCOUNT == 'stage') {
-            env.ECR_REPO = '23456.dkr.ecr.us-east-1.amazonaws.com/my-app'
-          } else if (params.AWS_ACCOUNT == 'prod') {
-            env.ECR_REPO = '55555.dkr.ecr.us-east-1.amazonaws.com/my-app'
-          }
-          echo "ECR Repo set to ${env.ECR_REPO}"
+          def cmd = "aws ecs list-clusters --region ${params.AWS_REGION} --query \"clusterArns[?contains(@,'${env.CLUSTER_PREFIX}')]\" --output text"
+          def clusters = runAws(cmd)
+          if (!clusters) { error "No cluster found with prefix ${env.CLUSTER_PREFIX} in ${params.AWS_REGION}" }
+          // choose last (latest) cluster when multiple exist
+          def clusterArn = clusters.tokenize().last()
+          env.CLUSTER_ARN = clusterArn
+          echo "Selected cluster: ${env.CLUSTER_ARN}"
         }
       }
     }
 
-    stage('Checkout') {
-      steps {
-        checkout scm
-      }
-    }
-
-    stage('Build & Push Docker Image') {
+    stage('Build & Push Image') {
       steps {
         script {
           env.IMAGE_TAG = "${env.BUILD_NUMBER}"
-          def loginAndPush = """
+          if (!params.ECR_REPO_URI?.trim()) {
+            // default repo mapping; replace account IDs with your values or pass ECR_REPO_URI
+            env.ECR_REPO = (params.AWS_ACCOUNT == 'prod') ? "55555.dkr.ecr.${params.AWS_REGION}.amazonaws.com/my-app-repo" : "12345.dkr.ecr.${params.AWS_REGION}.amazonaws.com/my-app-repo"
+          } else {
+            env.ECR_REPO = params.ECR_REPO_URI
+          }
+
+          def buildPush = """
+            set -e
             aws ecr get-login-password --region ${params.AWS_REGION} | docker login --username AWS --password-stdin ${env.ECR_REPO}
             docker build -t ${env.ECR_REPO}:${env.IMAGE_TAG} .
             docker push ${env.ECR_REPO}:${env.IMAGE_TAG}
           """
           if (params.AWS_CREDS?.trim()) {
-            withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: params.AWS_CREDS]]) {
-              sh loginAndPush
+            withCredentials([[$class:'AmazonWebServicesCredentialsBinding', credentialsId: params.AWS_CREDS]]) {
+              sh buildPush
             }
           } else {
-            sh loginAndPush
+            sh buildPush
+          }
+          echo "Pushed ${env.ECR_REPO}:${env.IMAGE_TAG}"
+        }
+      }
+    }
+
+    stage('Register Task Definition (image only)') {
+      steps {
+        script {
+          sh "jq '.containerDefinitions[0].image = \"${env.ECR_REPO}:${env.IMAGE_TAG}\"' ${TASK_DEF_TEMPLATE} > ${TASK_DEF_FILE}"
+
+          def registerCmd = "aws ecs register-task-definition --region ${params.AWS_REGION} --cli-input-json file://${TASK_DEF_FILE} --output json"
+          def regOut = runAws(registerCmd)
+          def regJson = readJSON text: regOut
+          env.NEW_TASK_ARN = regJson.taskDefinition.taskDefinitionArn
+          echo "Registered: ${env.NEW_TASK_ARN}"
+        }
+      }
+    }
+
+    stage('Create or Update Service') {
+      steps {
+        script {
+          // For 'create' action, create service (requires network config)
+          if (params.ACTION == 'create') {
+            // NOTE: update subnets/security groups to match your infra or pass via pipeline params
+            def createCmd = """
+            aws ecs create-service \
+              --region ${params.AWS_REGION} \
+              --cluster ${env.CLUSTER_ARN} \
+              --service-name ${env.SERVICE_NAME} \
+              --task-definition ${env.NEW_TASK_ARN} \
+              --desired-count 1 \
+              --launch-type FARGATE \
+              --network-configuration 'awsvpcConfiguration={subnets=[subnet-xxxx],securityGroups=[sg-xxxx],assignPublicIp=ENABLED}'
+            """
+            runAws(createCmd)
+          } else {
+            // update path
+            def currentTaskDef = runAws("aws ecs describe-services --region ${params.AWS_REGION} --cluster ${env.CLUSTER_ARN} --services ${env.SERVICE_NAME} --query 'services[0].taskDefinition' --output text") ?: ''
+            env.OLD_TASK_ARN = currentTaskDef
+            echo "Current taskDefinition: ${env.OLD_TASK_ARN}"
+            def updateCmd = "aws ecs update-service --region ${params.AWS_REGION} --cluster ${env.CLUSTER_ARN} --service ${env.SERVICE_NAME} --task-definition ${env.NEW_TASK_ARN}"
+            runAws(updateCmd)
           }
         }
       }
     }
 
-    stage('Fetch RDS Secret (Secrets Manager)') {
+    stage('Wait / Smoke Test / Persist') {
       steps {
         script {
-          // fetch secret (SecretString expected as JSON)
-          def getSecretCmd = "aws secretsmanager get-secret-value --region ${params.AWS_REGION} --secret-id ${env.SECRET_ID} --query SecretString --output text"
-          def secretJson
-          if (params.AWS_CREDS?.trim()) {
-            withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: params.AWS_CREDS]]) {
-              secretJson = sh(script: getSecretCmd, returnStdout: true).trim()
-            }
-          } else {
-            secretJson = sh(script: getSecretCmd, returnStdout: true).trim()
-          }
+          if (params.WAIT_FOR_STEADY) {
+            echo "Waiting for service to become stable..."
+            runAws("aws ecs wait services-stable --region ${params.AWS_REGION} --cluster ${env.CLUSTER_ARN} --services ${env.SERVICE_NAME}")
+            echo "Service stable. Running smoke test (if HEALTH_URL provided)..."
 
-          if (!secretJson) {
-            error("Failed to read secret ${env.SECRET_ID}")
-          }
-
-          def db = readJSON text: secretJson
-          // minimal validation
-          if (!db.username || !db.password) {
-            error("Secret ${env.SECRET_ID} must include 'username' and 'password' fields")
-          }
-
-          // write temp env file (short-lived)
-          writeFile file: 'rds_secrets.env', text: """DB_USERNAME=${db.username}
-DB_PASSWORD=${db.password}
-DB_HOST=${db.host ?: ''}
-DB_PORT=${db.port ?: ''}
-DB_NAME=${db.dbname ?: ''}
-"""
-        }
-      }
-    }
-
-    stage('Update ECS Task Definition') {
-      steps {
-        script {
-          // load env list and pass to withEnv as array of VAR=VALUE strings
-          def envList = readFile('rds_secrets.env').split('\n').findAll { it?.trim() }
-          // JQ command: ensure containerDefinitions[0].environment exists, update image, then append env vars
-          def jqCmd = """jq '
-    .containerDefinitions[0] |= ( . + { environment: ( .environment // [] ) } ) |
-    .containerDefinitions[0].image = "${env.ECR_REPO}:${env.IMAGE_TAG}" |
-    .containerDefinitions[0].environment += [
-      {"name":"DB_USERNAME","value":"'"'$DB_USERNAME'"'"},
-      {"name":"DB_PASSWORD","value":"'"'$DB_PASSWORD'"'"}
-    ]
-    ' ${TASK_DEF_TEMPLATE} > ${TASK_DEF_FILE}"""
-          withEnv(envList) {
-            sh(script: jqCmd)
-            // register task definition and capture the returned taskDefinitionArn
-            def registerCmd = "aws ecs register-task-definition --region ${params.AWS_REGION} --cli-input-json file://${TASK_DEF_FILE} --output json"
-            def regOut
-            if (params.AWS_CREDS?.trim()) {
-              withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: params.AWS_CREDS]]) {
-                regOut = sh(script: registerCmd, returnStdout: true).trim()
+            if (params.HEALTH_URL?.trim()) {
+              // run smoke test script against ALB/endpoint
+              try {
+                sh "HEALTH_URL='${params.HEALTH_URL}' scripts/smoke_test.sh"
+                echo "Smoke test passed — persisting lastKnownGood"
+                putLastKnownGood(params.AWS_REGION, env.SERVICE_NAME, env.NEW_TASK_ARN)
+              } catch (err) {
+                echo "Smoke test failed — attempting rollback"
+                def lastKnown = getLastKnownGood(params.AWS_REGION, env.SERVICE_NAME)
+                if (!lastKnown) {
+                  error "No lastKnownGood found to rollback to. Manual intervention required."
+                } else {
+                  echo "Rolling back to ${lastKnown}"
+                  runAws("aws ecs update-service --region ${params.AWS_REGION} --cluster ${env.CLUSTER_ARN} --service ${env.SERVICE_NAME} --task-definition ${lastKnown}")
+                  runAws("aws ecs wait services-stable --region ${params.AWS_REGION} --cluster ${env.CLUSTER_ARN} --services ${env.SERVICE_NAME}")
+                  error "Rolled back to lastKnownGood (${lastKnown})."
+                }
               }
             } else {
-              regOut = sh(script: registerCmd, returnStdout: true).trim()
-            }
-            def regJson = readJSON text: regOut
-            def newTaskDefArn = regJson.taskDefinition.taskDefinitionArn
-            def newFamily = regJson.taskDefinition.family
-            def newRevision = regJson.taskDefinition.revision
-            echo "Registered task-definition ${newFamily}:${newRevision} -> ${newTaskDefArn}"
-            // Save these for later stages
-            writeFile file: 'registered_task_info.txt', text: "${newTaskDefArn}\n${newFamily}\n${newRevision}\n"
-          }
-        }
-      }
-      post {
-        always {
-          // delete temp env file
-          sh 'rm -f rds_secrets.env || true'
-        }
-      }
-    }
-
-    stage('Approval Before Deploy') {
-      steps {
-        input message: "Approve deployment to ${params.AWS_ACCOUNT} (${params.AWS_REGION})? Image: ${env.ECR_REPO}:${env.IMAGE_TAG}", ok: "Deploy"
-      }
-    }
-
-    stage('Deploy/Update ECS Service') {
-      steps {
-        script {
-          def serviceName = params.ENVIRONMENT == 'x' ? env.SERVICE_X : env.SERVICE_Y
-          def registeredInfo = readFile('registered_task_info.txt').split('\n')
-          def newTaskArn = registeredInfo[0].trim()
-
-          def updateCmd = "aws ecs update-service --region ${params.AWS_REGION} --cluster ${env.ECS_CLUSTER} --service ${serviceName} --task-definition ${newTaskArn}"
-          if (params.AWS_CREDS?.trim()) {
-            withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: params.AWS_CREDS]]) {
-              sh updateCmd
+              echo "No HEALTH_URL set — skipping smoke test. Persists lastKnownGood optimistically."
+              putLastKnownGood(params.AWS_REGION, env.SERVICE_NAME, env.NEW_TASK_ARN)
             }
           } else {
-            sh updateCmd
-          }
-        }
-      }
-    }
-
-    stage('Rollback (on failure)') {
-      when { expression { currentBuild.currentResult == 'FAILURE' } }
-      steps {
-        script {
-          def serviceName = params.ENVIRONMENT == 'x' ? env.SERVICE_X : env.SERVICE_Y
-          // describe current running service to get current taskDefinition ARN
-          def descCmd = "aws ecs describe-services --region ${params.AWS_REGION} --cluster ${env.ECS_CLUSTER} --services ${serviceName} --query 'services[0].taskDefinition' --output text"
-          def currTaskDefArn = ''
-          if (params.AWS_CREDS?.trim()) {
-            withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: params.AWS_CREDS]]) {
-              currTaskDefArn = sh(script: descCmd, returnStdout: true).trim()
-            }
-          } else {
-            currTaskDefArn = sh(script: descCmd, returnStdout: true).trim()
-          }
-          if (!currTaskDefArn || currTaskDefArn == 'None') {
-            echo "Cannot determine current taskDefinition ARN for rollback."
-            return
-          }
-
-          // get family name
-          def family = currTaskDefArn.tokenize('/').last().tokenize(':')[0]
-          // list last 2 task-definitions for the family (sorted desc)
-          def listCmd = "aws ecs list-task-definitions --region ${params.AWS_REGION} --family-prefix ${family} --sort DESC --query 'taskDefinitionArns[:2]' --output json"
-          def listOut
-          if (params.AWS_CREDS?.trim()) {
-            withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: params.AWS_CREDS]]) {
-              listOut = sh(script: listCmd, returnStdout: true).trim()
-            }
-          } else {
-            listOut = sh(script: listCmd, returnStdout: true).trim()
-          }
-          def arr = readJSON text: listOut
-          if (arr.size() < 2) {
-            echo "No previous task definition found to rollback to."
-          } else {
-            def prev = arr[1]
-            echo "Rolling back ${serviceName} to ${prev}"
-            def rollbackCmd = "aws ecs update-service --region ${params.AWS_REGION} --cluster ${env.ECS_CLUSTER} --service ${serviceName} --task-definition ${prev}"
-            if (params.AWS_CREDS?.trim()) {
-              withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: params.AWS_CREDS]]) {
-                sh rollbackCmd
-              }
-            } else {
-              sh rollbackCmd
-            }
+            echo "Skipping wait & smoke test. Persisting new task as lastKnownGood (optimistic)."
+            putLastKnownGood(params.AWS_REGION, env.SERVICE_NAME, env.NEW_TASK_ARN)
           }
         }
       }
@@ -218,8 +148,34 @@ DB_NAME=${db.dbname ?: ''}
   }
 
   post {
-    always {
-      cleanWs()
+    always { cleanWs() }
+  }
+}
+
+// ------------------- helper functions -------------------
+def runAws(cmd) {
+  if (params.AWS_CREDS?.trim()) {
+    withCredentials([[$class:'AmazonWebServicesCredentialsBinding', credentialsId: params.AWS_CREDS]]) {
+      return sh(script: cmd, returnStdout: true).trim()
     }
+  } else {
+    return sh(script: cmd, returnStdout: true).trim()
+  }
+}
+
+def putLastKnownGood(region, service, arn) {
+  def item = "{\"ServiceName\":{\"S\":\"${service}\"},\"LastKnownGood\":{\"S\":\"${arn}\"}}"
+  runAws("aws dynamodb put-item --region ${region} --table-name ${env.DDB_TABLE} --item '${item}'")
+  echo "Updated lastKnownGood: ${arn}"
+}
+
+def getLastKnownGood(region, service) {
+  try {
+    def cmd = "aws dynamodb get-item --region ${region} --table-name ${env.DDB_TABLE} --key '{\"ServiceName\":{\"S\":\"${service}\"}}' --query 'Item.LastKnownGood.S' --output text"
+    def out = runAws(cmd)
+    if (!out || out == "None") { return null }
+    return out.trim()
+  } catch (err) {
+    return null
   }
 }
