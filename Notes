@@ -417,6 +417,86 @@ Important: Jenkins role must NOT have secretsmanager:GetSecretValue for the DB s
 
 
 
+— if you want your ECS task to retrieve RDS credentials from AWS Secrets Manager using IAM permissions, then creating and attaching an ECS task role is mandatory.
+
+Here’s why:
+	•	The ECS task role (taskRoleArn) is the IAM role that your container assumes at runtime.
+	•	Without it, your container will not have AWS API permissions to call secretsmanager:GetSecretValue (or any other AWS service).
+	•	This is different from the execution role (executionRoleArn), which ECS uses to pull images from ECR or send logs to CloudWatch.
+
+⸻
+
+ECS Roles Overview for Your Case
+Role Type
+Purpose
+Required for Your Use Case
+executionRoleArn
+Used by ECS agent to pull images from ECR, push logs to CloudWatch, etc.
+✅ Yes
+taskRoleArn
+Used by your application inside the container to access AWS resources like Secrets Manager, S3, RDS (via IAM authentication).
+✅ Yes (for Secrets Manager & RDS access)
+
+Example – Task Role Creation
+
+1️⃣ Create IAM Role
+
+aws iam create-role \
+    --role-name ecsTaskRole \
+    --assume-role-policy-document file://trust-policy.json
+
+trust-policy.json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": { "Service": "ecs-tasks.amazonaws.com" },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+
+2️⃣ Attach Policy for Secrets Manager
+aws iam attach-role-policy \
+    --role-name ecsTaskRole \
+    --policy-arn arn:aws:iam::aws:policy/SecretsManagerReadWrite
+(Or create a custom policy with only secretsmanager:GetSecretValue.)
+
+3️⃣ Reference in ECS Task Definition
+{
+  "family": "my-ecs-task",
+  "taskRoleArn": "arn:aws:iam::<account-id>:role/ecsTaskRole",
+  "executionRoleArn": "arn:aws:iam::<account-id>:role/ecsExecutionRole",
+  "containerDefinitions": [
+    {
+      "name": "my-app",
+      "image": "<ECR_REPO>:<TAG>",
+      "essential": true
+    }
+  ]
+}
+
+4️⃣ Inside Your Container (Python Example)
+Where the code should live
+	•	The code to retrieve RDS credentials should be inside your application’s startup/init logic, so every container—no matter if it’s the first or the 50th after scaling—knows how to fetch the credentials dynamically.
+	•	In Python, this is usually in:
+	•	A config module (e.g., config.py)
+	•	Or inside your main app entry point (e.g., app.py or main.py) before any DB connection is made.
+
+That way, the credentials are not baked into the container image — they are fetched fresh at runtime from Secrets Manager using the ECS task role permissions.
+CODE :- 
+import boto3
+import json
+
+client = boto3.client('secretsmanager', region_name="ap-south-1")
+secret_value = client.get_secret_value(SecretId="my-db-credentials")
+db_creds = json.loads(secret_value['SecretString'])
+
+print(db_creds['username'], db_creds['password'])
+
+If you skip creating the taskRoleArn, the above code will fail with:
+AccessDeniedException: User: anonymous is not authorized to perform: secretsmanager:GetSecretValue.
 
 
 
