@@ -1,0 +1,145 @@
+Linux Deep Dive Cheat Sheet for DevOps Interviews
+Networking & Ports
+Check open ports on local machine:
+ss -tuln
+ss -tulpn
+netstat -tulpn
+lsof -i -P -n | grep LISTEN
+Check if remote port is accessible:
+nc -zv <host> <port>
+nc -zv -w 3 <host> <port>
+curl -I http://<host>:<port>
+telnet <host> <port>
+nmap -p <port> <host>
+Disk & Filesystem
+Check free disk space:
+df -h
+df -Th
+df --total -h
+Check free inodes:
+df -i
+Disk usage by directory:
+du -sh *
+du -sh /var/log/*
+Find large files:
+find / -type f -size +500M 2>/dev/null
+System Resource Usage
+CPU, memory, processes:
+top
+htop
+ps aux --sort=-%cpu
+ps aux --sort=-%mem
+Memory usage:
+free -h
+vmstat 1 5
+Load average:
+uptime
+cat /proc/loadavg
+Logs & Monitoring
+Tail logs:
+tail -f /var/log/syslog
+Linux Deep Dive Cheat Sheet for DevOps Interviews
+tail -n 100 /var/log/messages
+Search inside logs:
+grep "ERROR" /var/log/syslog
+grep -i "fail" /var/log/auth.log
+grep -R "keyword" /path/to/dir
+Follow logs with filters:
+tail -f /var/log/syslog | grep "WARN"
+File & Directory Operations
+Find files:
+find / -name "filename"
+find /etc -type f -name "*.conf"
+Find by modified time:
+find /var/log -type f -mtime -1
+Permissions & ownership:
+ls -l
+chmod 644 file
+chmod +x script.sh
+chown user:group file
+Services
+Check service status:
+systemctl status ssh
+systemctl is-active ssh
+systemctl is-enabled ssh
+Start/stop/restart:
+sudo systemctl restart nginx
+Networking Configuration
+Show IP address:
+ip a
+hostname -I
+Routing table:
+ip route
+DNS resolution:
+nslookup example.com
+dig example.com
+Connectivity:
+ping -c 4 google.com
+traceroute google.com
+Linux Deep Dive Cheat Sheet for DevOps Interviews
+mtr google.com
+User & Permission Management
+id
+whoami
+who
+w
+last
+sudo -l
+User management:
+sudo useradd -m username
+sudo passwd username
+sudo userdel -r username
+Package Management
+Debian/Ubuntu:
+sudo apt update
+sudo apt install package
+dpkg -l | grep package
+RHEL/CentOS:
+sudo yum install package
+rpm -qa | grep package
+Process & Job Management
+ps -ef | grep process
+kill <pid>
+kill -9 <pid>
+jobs
+fg %1
+bg %1
+File Transfer
+scp file user@host:/path
+rsync -avz file user@host:/path
+wget URL
+curl -O URL
+Compression & Archiving
+tar -czvf archive.tar.gz folder/
+tar -xzvf archive.tar.gz
+zip -r archive.zip folder/
+unzip archive.zip
+SELinux & Firewall
+Linux Deep Dive Cheat Sheet for DevOps Interviews
+sestatus
+getenforce
+setenforce 0
+UFW firewall:
+sudo ufw status
+sudo ufw allow 22
+sudo ufw deny 80
+Firewalld:
+sudo firewall-cmd --state
+sudo firewall-cmd --list-all
+Misc. Admin
+Check system uptime:
+uptime
+Kernel & OS version:
+uname -a
+cat /etc/os-release
+Check last reboot:
+who -b
+One-Liner Troubleshooting
+Find top 10 biggest files:
+find / -type f -exec du -Sh {} + 2>/dev/null | sort -rh | head -n 10
+Check if specific port is listening:
+ss -tulpn | grep :80
+Check process holding a port:
+lsof -i :443
+Check failed login attempts:
+grep "Failed password" /var/log/auth.log
