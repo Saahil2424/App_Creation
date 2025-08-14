@@ -1,0 +1,1904 @@
+End-to-End Blue/Green ECS Sercive Creation CI/CD Process Flow - 
+
+1. Code Change
+ - Developer pushes/merges code (including Dockerfile and app code) to GitHub.
+
+2. Jenkins Pipeline Trigger
+ - Jenkins pipeline is triggered (manually or automatically).
+ - User selects action (create, update, delete) and environment (x or y).
+
+3. Build & Push Docker Image
+ - Jenkins checks out the latest code.
+ - Builds a Docker image, tags it (with build number or commit SHA), and pushes it to Amazon ECR.
+
+4. Fetch Secrets from AWS Secrets Manager
+ - Jenkins securely retrieves required secrets at runtime using AWS CLI.
+
+5. Update ECS Task Definition
+ - Jenkins updates the ECS task definition JSON with the new image tag and registers a new revision using AWS CLI.
+
+6. Deploy/Update/Delete ECS Service
+ - For create: Jenkins creates a new ECS service in the selected environment (x or y).
+ - For update: Jenkins updates the ECS service to use the new task definition.
+ - For delete: Jenkins scales down and deletes the ECS service.
+
+7. Rollback (if needed)
+ - If deployment fails during update, Jenkins rolls back the ECS service to the previous task definition.
+
+Key Points:
+
+Blue/Green (x/y) deployment enables zero-downtime releases and easy rollback.
+Secrets are managed securely via AWS Secrets Manager.
+Jenkins Credentials are used for AWS access.
+The process is automated, repeatable, and supports safe deployments.
+
+For this Blue/Green ECS CI/CD pipeline, you will need the following plugins and tools:
+
+Jenkins Plugins: - Amazon ECR plugin (for ECR integration, optional if using CLI) - Pipeline (Declarative and Scripted Pipeline support) - Credentials Binding Plugin (for securely using AWS credentials) - Git plugin (for GitHub integration) - Blue Ocean (optional, for modern UI) - AnsiColor (optional, for colored console output)
+
+Jenkins Agent Tools must be installed on jenkins agent: - Docker (to build and push images) - AWS CLI (to interact with ECR, ECS, and Secrets Manager) - jq (to manipulate JSON, e.g., updating ECS task definition) - Git (to clone repositories)
+
+AWS Services: - Amazon ECR (for Docker image storage) - Amazon ECS (for container orchestration) - AWS Secrets Manager (for secret management) - IAM (for permissions and roles)
+
+Other: - A GitHub (or other Git) repository for your code
+
+Make sure your Jenkins agent has all these tools installed,
+
+CODE - 
+
+pipeline {
+    agent any
+
+    environment {
+        ECR_REPO = '123456789012.dkr.ecr.us-east-1.amazonaws.com/my-app'
+        ECS_CLUSTER = 'my-ecs-cluster'
+        SERVICE_X = 'my-ecs-service-x'
+        SERVICE_Y = 'my-ecs-service-y'
+        TASK_DEF_TEMPLATE = 'ecs-task-def.json'
+        TASK_DEF_FILE = 'ecs-task-def-updated.json'
+        IMAGE_TAG = ''
+    }
+
+    parameters {
+        choice(name: 'AWS_ACCOUNT', choices: ['dev', 'stage', 'prod'], description: 'Select AWS Account')
+        choice(name: 'AWS_REGION', choices: ['us-east-1', 'us-west-2', 'eu-west-1'], description: 'Select AWS Region')
+        choice(name: 'ENVIRONMENT', choices: ['x', 'y'], description: 'Select environment (blue/green)')
+    }
+
+    stages {
+        stage('Select AWS Credentials') {
+            steps {
+                script {
+                    if (params.AWS_ACCOUNT == 'dev') {
+                        env.AWS_CREDS = 'aws-dev-creds'
+                    } else if (params.AWS_ACCOUNT == 'stage') {
+                        env.AWS_CREDS = 'aws-stage-creds'
+                    } else if (params.AWS_ACCOUNT == 'prod') {
+                        env.AWS_CREDS = 'aws-prod-creds'
+                    }
+                }
+            }
+        }
+
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Build & Push Docker Image') {
+            steps {
+                script {
+                    IMAGE_TAG = "${env.BUILD_NUMBER}"
+                    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: env.AWS_CREDS]]) {
+                        sh """
+                            aws ecr get-login-password --region ${params.AWS_REGION} | docker login --username AWS --password-stdin $ECR_REPO
+                            docker build -t $ECR_REPO:$IMAGE_TAG .
+                            docker push $ECR_REPO:$IMAGE_TAG
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Fetch Secrets from AWS Secrets Manager') {
+            steps {
+                script {
+                    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: env.AWS_CREDS]]) {
+                        env.MY_SECRET = sh(
+                            script: "aws secretsmanager get-secret-value --region ${params.AWS_REGION} --secret-id my/secret/id --query SecretString --output text",
+                            returnStdout: true
+                        ).trim()
+                    }
+                }
+            }
+        }
+
+        stage('Update ECS Task Definition') {
+            steps {
+                script {
+                    sh """
+                        jq '.containerDefinitions[0].image = "$ECR_REPO:$IMAGE_TAG"' $TASK_DEF_TEMPLATE > $TASK_DEF_FILE
+                        aws ecs register-task-definition --region ${params.AWS_REGION} --cli-input-json file://$TASK_DEF_FILE
+                    """
+                }
+            }
+        }
+
+        stage('Approval Before Deploy') {
+            steps {
+                input message: "Approve deployment to ECS in ${params.AWS_ACCOUNT} (${params.AWS_REGION})?", ok: "Deploy"
+            }
+        }
+
+        stage('Deploy/Update ECS Service') {
+            steps {
+                script {
+                    def serviceName = params.ENVIRONMENT == 'x' ? SERVICE_X : SERVICE_Y
+                    sh """
+                        aws ecs update-service --region ${params.AWS_REGION} --cluster $ECS_CLUSTER --service $serviceName --task-definition $(jq -r .family $TASK_DEF_FILE)
+                    """
+                }
+            }
+        }
+
+        stage('Rollback (on failure)') {
+            steps {
+                script {
+                    catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                        def serviceName = params.ENVIRONMENT == 'x' ? SERVICE_X : SERVICE_Y
+                        // Get current task definition ARN
+                        def currTaskDef = sh(
+                            script: "aws ecs describe-services --region ${params.AWS_REGION} --cluster $ECS_CLUSTER --services $serviceName --query 'services[0].taskDefinition' --output text",
+                            returnStdout: true
+                        ).trim()
+                        // Extract family name from ARN
+                        def family = currTaskDef.tokenize('/')[1].tokenize(':')[0]
+                        // Get previous revision ARN
+                        def prevTaskDef = sh(
+                            script: "aws ecs list-task-definitions --region ${params.AWS_REGION} --family-prefix ${family} --sort DESC --query 'taskDefinitionArns[1]' --output text",
+                            returnStdout: true
+                        ).trim()
+                        // Roll back to previous revision
+                        sh """
+                            aws ecs update-service --region ${params.AWS_REGION} --cluster $ECS_CLUSTER --service $serviceName --task-definition $prevTaskDef
+                        """
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            cleanWs()
+        }
+    }
+}
+
+
+
+
+
+
+
+I am working on Devops Project.
+We are having application which work is like there is one website I will go to that website and enter one number and it will internally or at backend check if data relted to this number is present in AWS RDS, If there is data it give us data in downloadable format on website.
+This application is deployed on totally AWS Cloud and this is dockerized application means it is docker based and deployed under ECS in AWS.
+We are having 2 diff AWS accounts for enviorments dev, prod eg. aws-dev, aws-prod and we have this app in both enviorments.
+We are having two git hub repo and both are integrated with jenkins via webhook and pollscm whenever PR is merged jenkins pipeline triggers
+1. For Infrastructure Creation Github Repo :
+In github repo we have terraform files which is used for infrastructure creation on aws like ecs cluster creation, vpc , ec2, asg, iam all thing which needed to deploy app on ecs cluster.
+we ahve jenkinsfile for jenkins pipleine which have code for jenkinspipeline stages in which stages are like i will ask us for the enviorment which env you want to run pipeline, then after it will fetch some secrets from aws secrets manager and ami for the ec2 ami page and the it will do terraform init, plan, balidate and apply and infrastructure will be created on aws.
+We are alos following some us ecases like th jenkins will also ask for optons like create, rehydate and destroy.
+Initially we will create infra, nonce it is created we need to rehydration every tim when new ami is launched so I will check if new ami is launched if its launched I will do builf with parameters choose rehydrate so the jenkins will fetch latest ami and store it as aramter and then pass this to terraform template/code and do th update as per his,eg,. inside asg launch templates the ai shuld be updated to latest one and we are also following rule like if suppose current ecs cluster name is ecs-cluster-x whenever we will do rehydrate it will change to ecs-cluster-y and also change ami to latest and names for resources like asg, new ec2 instance creating using asg would also change from instance=x to instance-y, conclusion is like the all thins in which ami changes are there should change from -x to =y at end by this we can ensure that rehydtae is completd and when i ru rehrdtae new cluster with -y at end will be created so cluster name ending with -x should eb deleted.
+2.For App creation :
+We have jenkinsfile, dockerfile and app code lets say python app source code in src folder in our github repo and process is like when i will try to trigger pipeline it will give me options create , update , delete for 1sttime I will choose create and once I choose create it will clone code from github and then build docker image and push that image to ecr and then create service under a specific ecs cluster build by the infra pipline by making use of docker image which is just built an if jenkins pipleine failed at any point the rollback is takig place it will rollback to previus dockeriamger verison which was working and the catch is like in my infra pipeline as I mentioned when we rehydrate the infa it will do -a and -y things at end of resources name so I also wnat to tacke this in this 2nd pipleine as when service weill be craetd or updated it should choose specific cluster as per the nedd and enviorments like dev, prod which are under diff aws accounts also be tackled carefully and same aws rds database secrets and the services are getiing created using aws cli.
+
+you need to store your AWS credentials for each account in Jenkins as "Credentials" so Jenkins can inject them securely into your pipeline.
+
+What to Store in Jenkins
+AWS Credentials for Each Account:
+
+Go to Manage Jenkins → Credentials.
+Add credentials of type AWS Credentials (or "Secret text" for access/secret keys).
+Give each a unique ID, e.g.:
+aws-dev-creds for your dev account (account ID: 12345)
+aws-prod-creds for your prod account (account ID: 55555)
+How Jenkins Uses Them:
+
+The Jenkinsfile uses the withCredentials block and the correct credentialsId (e.g., aws-dev-creds or aws-prod-creds) based on the environment.
+Jenkins injects the credentials as environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and optionally AWS_SESSION_TOKEN) for AWS CLI and Terraform.
+You Do Not Need to Store Account IDs:
+
+Account IDs (12345, 55555) are just variables for logic or passing to Terraform, not secrets.
+Summary:
+Store your AWS access keys for each account in Jenkins Credentials, and reference them by ID in your Jenkinsfile. No need to store account IDs as credentials—just use them as variables.
+
+
+
+
+
+
+
+SHELL - BASH SCRIPTING
+
+mkdir - make directory
+cd - change directory
+echo " " - uses to print the statement on screen.
+
+Script structure -
+
+Inside shell script first line is #!/bin/bash - this is shebang as this tells that which interpreter to be used to shell.
+
+we can also write last line as exit codes eg. exit 0 means successful, exit 1-225 means unsuccessful in the shell script file.
+
+chmod +x filename - give execute permisiion tof file.
+
+to run the file - ./myscript.sh or sh myscript.sh or bash myscript.sh
+
+
+Commenting in Bash :
+Commenting → Adds human-readable notes to your script.
+
+Purpose → Clarify code for yourself and others (especially useful when revisiting code after a while).
+Syntax → Use # at the start of a line for comments; Bash ignores these lines.
+
+Five Professional Metadata Elements for Bash Scripts to write as comments : 
+
+Author → Your name.
+
+Example: # Author: EE
+
+Date Created → When the script was originally made.
+
+Example: # Date Created: 2025-08-10
+
+Last Modified → When the script was last updated.
+
+Example: # Last Modified: 2025-08-15
+
+Description → Brief summary of what the script does.
+
+
+
+Linux File Permissions & Script Security :
+
+View perissions and details - ls -l or ls -lrt
+Output startig with d -> means directory , - -> means regular file and next 9 characters are 3 sets of 3 permisions First set → owner permissions, Second set → group permissions, Third set → other users’ permissions.
+r-read, w-write, x-execute,- means no permission.
+eg.
+drwxr-xr-x : means owner has all permission, group and others have read and execute and this is directory.
+-rw-r--r-- - this is file with read,write for owner and read read for group and others permission.
+4-read. 2-write, 1- execute.
+
+use command - chmod 744 filename it gives all permission to owner as 7 and read permission to group and others. 
+
+
+Backup Script How to create - 
+nano backupscript or vi backupscript
+tar -cvf ~/bash_course/my_backup_"$(date +%d-%m-%Y_%H-%M-%S)".tar ~/* 2>/dev/null
+tar → run the archive tool.
+
+-c → create a new archive.
+
+-x - extarct the files.
+
+-v → verbose output (show which files are being added).
+
+-f → specify the filename for the archive.
+
+~/bash_course/my_backup_"$(date +%d-%m-%Y_%H-%M-%S)".tar
+
+The destination file path & name.
+
+"$(date +%d-%m-%Y_%H-%M-%S)" inserts the current date & time (unique name).
+
+~/* → all files in your home directory.
+
+
+1.Create a tar.gz (compressed) archive-
+tar -czvf archive_name.tar.gz folder_name/
+2.Extract a tar.gz archive -
+tar -xzvf archive_name.tar.gz
+
+To check which shell type we have - echo $0
+whoami - show our user
+check other avilable shell in system - cat /etc/shells
+
+variables :
+
+Name=Sahil to access echo "Name is $Name"
+for constant : readonly Name = Sahil now if we try to change it will give error read only.
+
+Arrays : 
+myarray = (1 5 5 Sahil "Next Stop the Top!" )
+To access : echo "Value at  index is ${myArray[1]}"
+For all values : echo "Values are ${myArray[*]}"
+For specific Values : echo "Vlaues from index to index is ${myArray[*]:2:2}"
+Add values in array : myArray+=(5,5,5)
+
+Length of array : echo "Length is ${#myArray[*]}" #we need to use for length.
+
+Array with Index : 
+declare -A myArray
+myArray = ( [Name]=SAHIL [Age]=28)
+echo "Name is ${myArray[Name]}"
+
+Uppercase ${myArray^^} or ${Name^^}
+Lowercase ${x,,}
+
+Replace :
+newVar = "Hi buddy"
+newVar = ${myVar/buddy/SAHIL} -> Hi SAHIL
+newVar = ${myVar:1:2} -> Slicing One
+
+
+Taking Input from User :
+read name or read -p "Enter Your Name" name
+echo "Name is ${name}"
+
+For Arithematic things : 
+Add let at beggining
+let a =5*10 -> let says that this is arithmatic expression.
+
+Conditional Statements :
+
+a = 5 or read -p "Enter the Number" a
+
+
+-eq or == means equal
+-ge means greterthanorequal
+-le means lessthanorequal
+-ne or != means not equal
+-gt means greater than
+-lt means lessthan
+
+if [[ $a -gt 2 ]]  inside bracket give space at start and end
+then
+	echo "Greater"
+else
+	echo "less"
+fi
+
+--------------
+
+if [[ $a -gt 2 ]]  inside bracket give space at start and end
+then
+	echo "Greater"
+elif [[ $a -gt 3 ]]
+then
+	echo "Greater also"
+else
+	echo "Less"
+fi
+
+--------------------
+What if more conditions it will be lengthy.
+We can use case
+
+echo "Choose an option"
+echo "a=See Date"
+echo "b=List all the files"
+read choice
+case $choice in
+	a)date;;
+	b)ls;;
+	*)echo "Provide Valid Value"  - in case if user input wrong thing.
+esac
+
+----------------------------
+
+&& And / || or
+
+if [[ $age -ge 28 ]] && [[ $country == "India" ]]
+then
+	echo 
+else
+	echo
+fi
+
+conditon 1 && codition2 || condition 3
+
+-----------------------------------
+
+FOR Loop
+
+for i in {1..5}
+for i in Next Stop The Top
+do
+	echo "$i"
+done
+
+--------------------------
+
+To read content of file - 
+
+#! /bin/bash
+FILE = "Path of folder where files are stored"
+
+for name in $(cat $FILE)
+do
+	echo "Name is $name"
+done
+
+--------------------------------------
+
+#! /bin/bash
+myArr = (1 2 3 4 5) 
+length = ${#myArr[*]}
+
+
+for (( i=0;i<$lenght;i++ ))
+do
+	echo "Value is %{myArr[$i]}"
+done
+
+--------------------------------------
+
+for (( ;; ))
+do
+	echo "Infinite loop"
+	sleep 2s
+done
+
+-------------------------------------------
+
+Same for Infinite Loop
+while true
+do
+	echo " Hi SAHIL"
+	sleep 2s
+done
+
+------------------------------------------------
+
+read content from while loop
+
+while read myVar
+do
+	echo "$myVar"
+done < names.txt  -> names.txt is file name from which we are reading content.
+
+-----------------------------------------------
+
+read content from csv file - IFS means Internal FIeld Seprator
+
+while IFS="," read id,name,age :-id,name and age are colums in csv file.
+do
+	echo "$id"
+	echo "$name"
+	echo "$age"
+done < mycsv.csv       - csv fie name form which conetnt we need.
+
+-----------------------------------------------------
+
+Functions :
+
+function welcome {
+	echo "Welcome Bro"
+}
+
+or 
+
+welcome (){
+	echo "Welcome Bro"	
+}
+#To call funtion
+welcome
+
+---------------------------------------------------------
+
+addition (){
+local num1 = $1
+local num2 = $2
+let sum = $num1+$num2
+echo "$sum"
+}
+
+addition 5 5 - after addition first 5 is $1 as 1st argument and so on.
+
+-------------------------------------------------------------
+
+Arguments in Script :
+
+#! /bin/bash
+echo "First argument is $1"    - 5
+echo "Second argument is $2"   - 5
+echo "All arguments are $@"    - 5 5
+echo "No of arguments are $# " - 2
+
+while executing script - bash myscrpit.sh 5 5 
+
+-------------------------------------------------------------
+
+for loop to access arguments from All argument :
+
+for numbers in $@
+do
+	echo " $numbers"
+done
+
+-----------------------------------------------------------
+
+if we run bash myscript SAHIL Next Stop The Top
+What will happen $1 will get SAHIL and $2 will only get Next but we want description as the total Line so use shift.
+
+echo "Creating User"
+echo "Username is $1"
+
+shift
+echo "Description is $2"
+
+---------------------------------------------------------------------
+continue and break :
+
+no = 5
+
+for i in {1 2 ....}
+do
+	if [[ $no -eq $i ]]
+	then
+		echo "$no is found"
+		break
+	fi
+	echo "No is $i"
+done
+
+------------------------------------------------------
+
+if we ping -c 1 www.google.com
+if ping is successful
+we can check exit status by command - echo $? if 1 menad failed if 0 means success.
+
+Write this as a script
+
+#! /bisn/bash
+read -p "Site to Open" site
+ping -c 1 $site
+if [[ $? -eq 0 ]]
+	echo "Success"
+else	
+	echo "Not Successful"
+fi
+
+----------------------------------------------------------------
+
+basename /home/bin/myprac.csv  - myprac.csv gives only file name
+dirname /home/bin/myprac.csv - /home/bin - strip file name and give only path
+
+
+------------------------------------------------------------
+
+check if file or directory exist
+
+if [ -d folder name ] - if folder exist
+
+if [ ! -d folder name ]  - if folder not exists
+
+if [ -f file name ] - if file exist
+
+if [ ! -f file name ] - if file not exist
+
+--------------------------------------------------------------------
+
+FILEPATH = "/home/user/myprac.txt"
+
+if [[ -f $FILEPATH ]]
+then
+	echo "File Exist"
+else	
+	echo "Not Exist Creating"  - we can also do that if not exist then create.
+	touch $FILEPATH
+fi
+
+------------------------------------------------------
+
+BASH VARIABLES - 
+
+echo $UID - shows userid if 0 means root user.
+
+Redirection in script : > >>
+
+lets say if there are many files in on foder and we only want names  for the files :
+
+ls > all.txt   - ls command output stored in all.txt file
+> will overwrite the file contents
+if we run date < all.txt - ls will be gone date will be stored.
+if we want to append use >>
+ls >> all.txt
+date >> all.txt
+now both will be stored in tnew txt file.
+
+Now if we want that on friday we run script and we want to check logs on monday :
+Eg.
+#!/bin/bash
+ping -c 1 www.google.com >> redirect.log
+now if we ru this bash file redirect file we be having ou[put as we are saving in to it.
+
+What is /dev/null - if we dont want to print ouput or save in any file
+menas if we run ping -c 1 www.google.com it will show some data on terminal
+but if we dont wnat to print that
+ping -c 1 www.google.com &> /dev/null
+
+
+Log Messages - If you want to maintai the loggong for your script you can use LOGGER in your script.
+You can find logs under /var/logs/messages
+#!/bin/bash
+logger "This is log from ${0}"  ${0} - means file name as per argument.
+now after running this file logs will get stored.
+This need sudo access.
+
+We can enable debugging for the script.
+Use Set -x at starting of file.
+#!/bin/bash
+set -x
+... so on script
+
+
+If want to exit if any command in script fails.
+Use set -e at start.
+#!/bin/bash
+set -e
+... so on script
+
+Running script in background.
+used nohup
+nohup ./myscript.sh & - by this it will run in background and you can use terminal for diff purpose and if terminal is closed it will not stop.
+
+Automate using CRONTAB or AT
+atq - all schedules job shown.
+atrm id - to remove scheduled jobs.
+for one time - use AT
+at 02:58 PM - it will ask what to run - CTRL D - now give full path for file.
+for more times or days - use CRON
+crontab -l  - shows all crontabs present ones.
+contab -e - to create new job inside it add below type of lines.
+24 55 * * * cd /home/user && ./myprac.sh
+now if you run crontab -l - this will be present.
+
+PROJECTS - 
+
+To check free ram : free or free -h or free -mt
+free mt | grep "Total"
+
+df- show info about filesystem shoows like disk C:, D: in windows.
+
+
+
+
+
+
+
+Linux & Shell Scripting Interview Questions (75 Q&A)
+1–15: Basic Linux Commands
+
+Q: How do you find your current working directory?
+A:
+
+pwd
+
+
+Q: How do you list hidden files?
+A:
+
+ls -la
+
+
+Q: How do you find the number of lines in a file?
+A:
+
+wc -l filename
+
+
+Q: How do you search for a string in a file?
+A:
+
+grep "pattern" filename
+
+
+Q: How to find the top 10 CPU-consuming processes?
+A:
+
+top
+# Press Shift+P to sort by CPU usage
+
+
+Q: How do you kill a process by name?
+A:
+
+pkill process_name
+
+
+Q: How do you display disk usage in human-readable format?
+A:
+
+df -h
+
+
+Q: How do you check memory usage?
+A:
+
+free -h
+
+
+Q: How do you find the absolute path of a command?
+A:
+
+which command_name
+
+
+Q: How to check which user is logged in?
+A:
+
+who
+
+
+Q: How to check last 10 lines of a file in real-time?
+A:
+
+tail -f filename
+
+
+Q: How do you change file permissions?
+A:
+
+chmod 755 file
+
+
+Q: How do you change the owner of a file?
+A:
+
+chown user:group file
+
+
+Q: How do you find a file in a directory recursively?
+A:
+
+find /path -name "filename"
+
+
+Q: How to get only directories in a path?
+A:
+
+ls -d */
+
+16–35: Shell Scripting Basics
+
+Q: How do you take input from a user in shell script?
+A:
+
+read -p "Enter name: " name
+echo "Hello $name"
+
+
+Q: How do you store command output in a variable?
+A:
+
+files=$(ls)
+
+
+Q: How to check if a file exists in shell script?
+A:
+
+if [ -f filename ]; then
+    echo "File exists"
+fi
+
+
+Q: How to check if a directory exists?
+A:
+
+if [ -d dir ]; then
+    echo "Directory exists"
+fi
+
+
+Q: How to loop over files in a directory?
+A:
+
+for file in /path/*; do
+    echo "$file"
+done
+
+
+Q: How to loop numbers 1 to 10 in shell?
+A:
+
+for i in {1..10}; do
+    echo $i
+done
+
+
+Q: How to pass arguments to shell script?
+A: $1, $2 represent arguments. Example:
+
+echo "First argument: $1"
+
+
+Q: How to find the number of arguments passed to script?
+A:
+
+echo "Number of args: $#"
+
+
+Q: How to get all arguments as a single string?
+A:
+
+echo "$@"
+
+
+Q: How to check if two strings are equal in shell?
+A:
+
+if [ "$a" = "$b" ]; then
+    echo "Equal"
+fi
+
+
+Q: How to check if a variable is empty?
+A:
+
+if [ -z "$var" ]; then
+    echo "Empty"
+fi
+
+
+Q: How to debug a shell script?
+A:
+
+bash -x script.sh
+
+
+Q: How to run a command every 5 seconds?
+A:
+
+watch -n 5 "command"
+
+
+Q: How to check exit status of last command?
+A:
+
+echo $?
+
+
+Q: How to schedule a script with cron every day at 2 AM?
+A:
+
+0 2 * * * /path/script.sh
+
+
+Q: How to send an email in Linux from shell?
+A:
+
+echo "Body" | mail -s "Subject" user@example.com
+
+
+Q: How to replace a string in a file using shell?
+A:
+
+sed -i 's/old/new/g' file
+
+
+Q: How to merge two files line by line?
+A:
+
+paste file1 file2
+
+
+Q: How to sort a file?
+A:
+
+sort file
+
+
+Q: How to remove duplicate lines from a file?
+A:
+
+sort file | uniq
+
+36–60: Scenario-Based & Tricky
+
+Q: Find files modified in the last 7 days.
+A:
+
+find /path -type f -mtime -7
+
+
+Q: Compress and extract tar.gz file.
+A:
+
+tar -czf file.tar.gz dir/
+tar -xzf file.tar.gz
+
+
+Q: Find files > 100MB.
+A:
+
+find /path -type f -size +100M
+
+
+Q: Replace spaces in filenames with underscores.
+A:
+
+for f in *\ *; do mv "$f" "${f// /_}"; done
+
+
+Q: Find all files owned by a user.
+A:
+
+find / -user username
+
+
+Q: Count number of files in a directory recursively.
+A:
+
+find /path -type f | wc -l
+
+
+Q: Print only matching lines from multiple files.
+A:
+
+grep "pattern" file1 file2
+
+
+Q: Monitor log file for a keyword in real-time.
+A:
+
+tail -f log.txt | grep "ERROR"
+
+
+Q: Find difference between two files.
+A:
+
+diff file1 file2
+
+
+Q: Merge contents of multiple files into one.
+A:
+
+cat file1 file2 > merged.txt
+
+
+Q: Find top 5 largest files in /var/log.
+A:
+
+find /var/log -type f -exec du -h {} + | sort -rh | head -5
+
+
+Q: Get IP address of Linux machine.
+A:
+
+hostname -I
+
+
+Q: Display all environment variables.
+A:
+
+env
+
+
+Q: Check if a process is running.
+A:
+
+pgrep process_name
+
+
+Q: Show only running services.
+A:
+
+systemctl list-units --type=service --state=running
+
+
+Q: Restart a service.
+A:
+
+sudo systemctl restart service_name
+
+
+Q: Check system uptime.
+A:
+
+uptime
+
+
+Q: Get current logged-in user.
+A:
+
+whoami
+
+
+Q: Change shell to bash permanently.
+A:
+
+chsh -s /bin/bash
+
+
+Q: Search for a package in yum.
+A:
+
+yum search package_name
+
+
+Q: Check last reboot time.
+A:
+
+who -b
+
+
+Q: Get kernel version.
+A:
+
+uname -r
+
+
+Q: Show disk partitions.
+A:
+
+lsblk
+
+
+Q: Mount an ISO file.
+A:
+
+mount -o loop file.iso /mnt
+
+
+Q: Check open ports.
+A:
+
+netstat -tuln
+
+61–75: High-Value Real-World Questions
+
+Q: You have two folders, print files in folder B only if they match a file in folder A.
+A:
+
+for file in folderB/*; do
+    fname=$(basename "$file")
+    if [ -f "folderA/$fname" ]; then
+        cat "folderB/$fname"
+    fi
+done
+
+
+Q: Monitor CPU usage and alert if > 80%.
+A:
+
+cpu=$(top -bn1 | grep "Cpu(s)" | awk '{print $2 + $4}')
+if (( ${cpu%.*} > 80 )); then
+    echo "High CPU: $cpu%"
+fi
+
+
+Q: Check if a website is up.
+A:
+
+curl -Is https://example.com | head -1
+
+
+Q: Find and delete files older than 30 days.
+A:
+
+find /path -type f -mtime +30 -delete
+
+
+Q: Extract only specific column from CSV.
+A:
+
+cut -d',' -f2 file.csv
+
+
+Q: Get 3 most recent files in a folder.
+A:
+
+ls -lt | head -3
+
+
+Q: Find and count number of failed SSH logins.
+A:
+
+grep "Failed password" /var/log/auth.log | wc -l
+
+
+Q: Archive logs by date.
+A:
+
+tar -czf logs-$(date +%F).tar.gz /var/log/*
+
+
+Q: Test network speed from Linux.
+A:
+
+speedtest-cli
+
+
+Q: Remove empty lines from file.
+A:
+
+sed '/^$/d' file
+
+
+Q: Sort a file by 2nd column (numeric).
+A:
+
+sort -k2 -n file
+
+
+Q: Rename multiple files with prefix.
+A:
+
+for f in *; do mv "$f" "prefix_$f"; done
+
+
+Q: Find symbolic links in a directory.
+A:
+
+find /path -type l
+
+
+Q: Check if a port is reachable.
+A:
+
+nc -zv host port
+
+
+Q: Extract only IP addresses from file.
+A:
+
+grep -oE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' file
+
+
+1. Rotate logs manually without logrotate
+
+Q: How would you manually rotate a log file /var/log/app.log without using logrotate?
+A:
+
+mv /var/log/app.log /var/log/app.log.$(date +%F)
+touch /var/log/app.log
+chmod 644 /var/log/app.log
+systemctl restart myapp   # if app needs restart to reopen log
+
+2. Find processes using more than 1GB memory
+
+Q:
+
+ps -eo pid,ppid,cmd,%mem --sort=-%mem | awk '$4 > 10'
+
+
+%mem > 10 means more than 10% RAM.
+
+3. Debug a failed systemd service
+
+Q: Service failed to start, how do you debug?
+A:
+
+systemctl status myservice
+journalctl -u myservice --since "10 min ago"
+
+4. Check why a port is not listening
+
+A:
+
+ss -tulnp | grep :8080
+sudo netstat -tulnp | grep 8080
+sudo lsof -i:8080
+
+5. Find files changed in last 1 hour
+
+A:
+
+find /path/to/dir -type f -mmin -60
+
+6. Extract only error lines from a log
+
+A:
+
+grep -i "error" /var/log/myapp.log
+
+7. Monitor CPU usage of a single process
+
+A:
+
+top -p <PID>
+pidstat -p <PID> 1
+
+8. Check why a disk is filling up
+
+A:
+
+df -h
+du -sh /* 2>/dev/null | sort -h
+
+9. Kill a process stuck in D state
+
+Note: D = uninterruptible sleep; can’t be killed until IO finishes.
+A: Usually requires fixing IO issue or reboot.
+
+10. Search for a string in multiple .log files
+
+A:
+
+grep -rnw /var/log/ -e "Timeout"
+
+11. Get IP address of the server
+
+A:
+
+hostname -I | awk '{print $1}'
+
+12. Compress and extract tar.gz
+
+A:
+
+tar -czvf archive.tar.gz /path/to/files
+tar -xzvf archive.tar.gz
+
+13. Check kernel messages for hardware issues
+
+A:
+
+dmesg | grep -i error
+
+14. Count number of running Docker containers
+
+A:
+
+docker ps -q | wc -l
+
+15. Find top 5 CPU-consuming processes
+
+A:
+
+ps -eo pid,cmd,%cpu --sort=-%cpu | head -n 6
+
+16. Monitor open file descriptors
+
+A:
+
+lsof | wc -l
+lsof -p <PID>
+
+17. Folder A/B matching scenario (Your earlier interview question)
+
+Q: You have two folders. Print files in folder B only if they match a file in folder A.
+A:
+
+for file in folderB/*; do
+    if [ -f "folderA/$(basename "$file")" ]; then
+        cat "$file"
+    fi
+done
+
+18. Find the 10 largest files on system
+
+A:
+
+find / -type f -exec du -h {} + 2>/dev/null | sort -hr | head -n 10
+
+19. Tail a log and highlight ERROR lines
+
+A:
+
+tail -f /var/log/app.log | grep --color=always -i error
+
+20. Check all failed SSH login attempts
+
+A:
+
+grep "Failed password" /var/log/auth.log
+
+
+
+Advanced AWS DevOps Engineer – Docker Container Deployment Scenarios
+Infrastructure & Deployment
+
+Scenario:
+You have a microservices application deployed in Docker containers on AWS ECS (EC2 launch type). The application needs zero downtime deployments. How would you achieve this?
+Answer:
+
+Use ECS service with Application Load Balancer and enable deployment type: rolling update or blue/green with CodeDeploy.
+
+Blue/Green flow: deploy new task definition revision → ECS spins up new tasks → ALB switches traffic → old tasks drained.
+
+Ensure deregistrationDelay is short in target group for quick switchover.
+
+Scenario:
+The application is deployed in Docker containers on EC2 instances. A new container fails to start because the port is already in use. How will you troubleshoot and fix it?
+Answer:
+
+SSH into EC2 instance.
+
+Run sudo lsof -i :<port> or netstat -tulpn | grep <port> to see the process using the port.
+
+Stop conflicting container/service.
+
+Adjust Docker run command or ECS task definition to use a free port.
+
+Scenario:
+You are using ECS with Fargate, but the container starts and then immediately stops. How do you debug this without SSH access?
+Answer:
+
+Enable CloudWatch logs in ECS task definition.
+
+Check docker logs equivalent in CloudWatch.
+
+Validate entrypoint/command correctness.
+
+Check container health check configuration (may kill containers if failing).
+
+Scenario:
+Your containerized app on AWS experiences increased memory usage and eventually OOM (Out of Memory) errors. How do you resolve it?
+Answer:
+
+Check docker stats or CloudWatch metrics.
+
+Increase memory limits in ECS/Fargate task definition.
+
+Optimize app code (memory leaks, cache size).
+
+Use sidecar containers for heavy tasks like logging or file processing.
+
+Scenario:
+During ECS blue/green deployment, the new version fails health checks but ECS rolls back too slowly.
+Answer:
+
+Reduce minimumHealthyPercent in deployment configuration.
+
+Tune health check interval & timeout in target group.
+
+Add pre-deployment tests to detect issues earlier.
+
+CI/CD & Automation
+
+Scenario:
+You want to build, scan, and deploy Docker images to AWS ECR via Jenkins. What’s the flow?
+Answer:
+
+Build stage: docker build -t <repo>:<tag> .
+
+Scan stage: Use trivy or AWS ECR image scan API.
+
+Push stage: docker push <repo>:<tag> (after aws ecr get-login-password).
+
+Deploy stage: Update ECS service/task definition with new image.
+
+Scenario:
+You need to deploy the same containerized app to multiple AWS accounts from Jenkins. How would you handle authentication?
+Answer:
+
+Use AWS cross-account roles with STS AssumeRole in Jenkins pipeline.
+
+Store credentials in Jenkins credentials store.
+
+Switch context in pipeline based on environment.
+
+Scenario:
+The Jenkins pipeline should trigger only when the Dockerfile or app source changes.
+Answer:
+
+Use Jenkins multibranch pipeline with GitHub webhooks.
+
+In when condition:
+
+when {
+  changeset "**/Dockerfile", "**/src/**"
+}
+
+Networking & Scaling
+
+Scenario:
+The app in Docker containers is intermittently failing due to DNS resolution issues in ECS.
+Answer:
+
+Ensure ECS tasks use the awsvpc network mode.
+
+Verify VPC DNS hostnames enabled.
+
+Check /etc/resolv.conf inside container.
+
+Use Cloud Map for service discovery.
+
+Scenario:
+Your app requires horizontal scaling when CPU > 70%.
+Answer:
+
+Enable ECS Service Auto Scaling with CloudWatch alarms.
+
+Example:
+
+Alarm: CPUUtilization > 70% for 5 mins → Scale Out +2 tasks.
+
+Alarm: CPUUtilization < 30% for 5 mins → Scale In -1 task.
+
+Security & Compliance
+
+Scenario:
+You need to prevent containers from running as root in ECS.
+Answer:
+
+In Dockerfile: USER nonrootuser.
+
+In ECS task definition: set user parameter.
+
+Use IAM task roles for least privilege.
+
+Scenario:
+How do you scan running containers in AWS for vulnerabilities?
+Answer:
+
+Use AWS Inspector (ECR scanning).
+
+Integrate tools like Trivy, Clair into CI/CD.
+
+Run periodic scans of running containers with trivy --docker-host.
+
+Monitoring & Logging
+
+Scenario:
+Logs from the container are not appearing in CloudWatch.
+Answer:
+
+Check logConfiguration in ECS task definition.
+
+Ensure IAM role has logs:CreateLogStream and logs:PutLogEvents.
+
+Verify container is writing logs to stdout/stderr.
+
+Scenario:
+Container CPU usage spikes but app is still slow.
+Answer:
+
+Use docker stats and CloudWatch metrics.
+
+Check if throttling occurs due to CPU limits.
+
+Investigate DB latency or network bottlenecks.
+
+Advanced AWS DevOps + Docker Scenario Questions
+1. ECS Task Crash Loop
+
+Your application is running in AWS ECS on EC2 launch type, but a specific container keeps going into a crash loop. How do you troubleshoot?
+
+Answer:
+
+Check ECS task logs in CloudWatch (aws logs get-log-events or AWS Console).
+
+Verify CMD/ENTRYPOINT in Dockerfile — ensure it's correct.
+
+SSH into ECS EC2 instance, run docker logs <container-id>.
+
+Ensure environment variables (from SSM or Secrets Manager) are present.
+
+Validate that port mappings match service definition.
+
+Use docker run locally to replicate crash and debug.
+
+2. Container Can’t Reach RDS
+
+Your Docker containerized app on ECS is failing to connect to an RDS instance. What’s your debugging process?
+
+Answer:
+
+Check Security Groups — ECS SG must allow outbound to RDS SG.
+
+Validate RDS SG inbound rules (3306 for MySQL, 5432 for PostgreSQL).
+
+Ensure both ECS and RDS are in the same VPC/subnet or use VPC peering.
+
+Check DNS resolution from inside container (nslookup <rds-endpoint>).
+
+Test connectivity:
+
+docker exec -it <container> bash
+nc -vz <rds-endpoint> 3306
+
+3. Zero Downtime Deployment
+
+You need to update a containerized app on ECS without downtime. How do you approach it?
+
+Answer:
+
+Use ECS rolling update with minimumHealthyPercent=100 and maximumPercent=200.
+
+Push new image to ECR with a unique tag (build number or commit SHA).
+
+Update ECS service with new task definition revision.
+
+Let old tasks drain gracefully before stopping.
+
+4. Docker Image Too Large
+
+Your container image size is 2GB, causing slow ECS deployments. How do you optimize?
+
+Answer:
+
+Use multi-stage builds in Dockerfile.
+
+Switch to smaller base images (alpine, distroless).
+
+Remove unnecessary packages & caches:
+
+RUN apt-get clean && rm -rf /var/lib/apt/lists/*
+
+
+Use .dockerignore to skip copying unnecessary files.
+
+Rebuild and push to ECR.
+
+5. ECS Service Stuck in PROVISIONING
+
+Your ECS service never moves from PROVISIONING to RUNNING. What’s your process?
+
+Answer:
+
+Check EC2 capacity in ASG (if using EC2 launch type).
+
+Verify IAM role permissions for ECS agent.
+
+Check if required container ports are free.
+
+Look for missing ECR image pull permissions.
+
+Use:
+
+aws ecs describe-services --cluster <cluster-name>
+
+6. Application Load Balancer Health Check Failures
+
+ECS service is failing ALB health checks after deployment.
+
+Answer:
+
+Ensure container responds correctly to the ALB health check path.
+
+Match container port to target group health check port.
+
+Increase health check timeout and interval.
+
+Test endpoint from inside container with curl localhost:<port>.
+
+7. Secret Rotation Without Downtime
+
+How would you rotate database credentials stored in AWS Secrets Manager for an ECS containerized app without downtime?
+
+Answer:
+
+Enable automatic rotation in Secrets Manager.
+
+Use ECS task definition with secrets parameter to inject credentials at startup.
+
+Deploy updated tasks gradually (rolling update).
+
+Use application-level DB connection pool that refreshes credentials without restart.
+
+8. Multi-Account ECS Deployment via Jenkins
+
+You need to deploy Dockerized applications to multiple AWS accounts from Jenkins.
+
+Answer:
+
+Store Terraform code in GitHub.
+
+Use Jenkins pipeline with terraform workspace for each account.
+
+Use assume-role via AWS CLI for cross-account deployments.
+
+Example:
+
+aws sts assume-role --role-arn arn:aws:iam::<account-id>:role/DeployRole
+
+9. ECS Task Disk Space Full
+
+Your container stops because / inside ECS host is full.
+
+Answer:
+
+SSH into ECS host: df -h to check usage.
+
+Clean up old Docker images:
+
+docker system prune -af
+
+
+Move logs to CloudWatch and clear local logs.
+
+Increase ECS host EBS volume size if recurring.
+
+10. Canary Deployment with Docker
+
+How would you do a canary release for a Dockerized application on ECS?
+
+Answer:
+
+Create a second ECS service with new image.
+
+Route small % traffic using ALB weighted target groups or AWS App Mesh.
+
+Gradually shift traffic after validating performance.
+
+1. Docker Container Not Starting in ECS
+
+Scenario: You deployed a new Docker image to ECS. The container starts, runs for 2 seconds, then stops.
+
+Question: How would you troubleshoot?
+
+Answer:
+
+Check ECS task logs via CloudWatch to see if the container exited due to application error.
+
+Run docker run -it <image> /bin/sh locally to debug.
+
+Ensure the CMD in Dockerfile matches the application startup script.
+
+Verify health check configuration in ECS isn’t killing it prematurely.
+
+2. ECS Service Stuck in “Provisioning” State
+
+Scenario: Your ECS service never moves to the “Running” state.
+
+Question: Possible causes and fixes?
+
+Answer:
+
+Insufficient CPU/memory in cluster → Scale up EC2 instances or Fargate capacity.
+
+IAM role missing permissions for ECS task execution.
+
+Container image not accessible (ECR repo permissions).
+
+ALB health checks failing → fix target group config.
+
+3. Deploying Zero-Downtime Updates to ECS
+
+Scenario: You need to deploy a new version of a container without downtime.
+
+Question: How do you achieve this?
+
+Answer:
+
+Use rolling updates in ECS service with minimumHealthyPercent=100 and maximumPercent=200.
+
+Attach an ALB to ECS; health check passes before traffic routing.
+
+Optionally, use blue/green deployment with AWS CodeDeploy.
+
+4. Debugging High CPU Usage in a Container
+
+Scenario: A containerized app is using high CPU in ECS.
+
+Question: How to debug?
+
+Answer:
+
+SSH into ECS host → docker stats to identify container usage.
+
+Use docker exec -it <container> top to see processes.
+
+Check for memory leaks or infinite loops in application code.
+
+5. Persistent Data in Docker on AWS
+
+Scenario: App data is lost when the container restarts.
+
+Question: How do you persist data?
+
+Answer:
+
+Mount an EFS volume for persistent storage.
+
+Or use an RDS database for data persistence.
+
+Avoid writing to container filesystem directly.
+
+6. ECS Auto-Scaling Not Triggering
+
+Scenario: CPU utilization hits 90%, but ECS service doesn't scale.
+
+Question: Possible root causes?
+
+Answer:
+
+CloudWatch alarm threshold or evaluation period misconfigured.
+
+Auto Scaling policy not linked to ECS service.
+
+Insufficient container instance capacity in cluster.
+
+7. Docker Image Size Optimization
+
+Scenario: Image is 2GB, slowing deployments.
+
+Question: How to reduce size?
+
+Answer:
+
+Use smaller base images (alpine).
+
+Multi-stage builds to keep only necessary binaries.
+
+Clean package manager cache in same layer.
+
+8. ECS Task Can’t Pull Image
+
+Scenario: ECS task fails with “CannotPullContainerError.”
+
+Question: Causes and fixes?
+
+Answer:
+
+IAM role missing ecr:GetAuthorizationToken.
+
+Image URI incorrect.
+
+Cross-region ECR access not set up.
+
+9. Multi-Container App Communication
+
+Scenario: Two containers in the same ECS task can’t talk to each other.
+
+Question: How to enable communication?
+
+Answer:
+
+Use localhost and the container's port mappings.
+
+Ensure both containers are in the same network namespace (same task).
+
+10. Blue/Green Deployment Rollback
+
+Scenario: After deploying a new container version, errors increase.
+
+Question: How to rollback quickly?
+
+Answer:
+
+In ECS, revert task definition to previous revision.
+
+With CodeDeploy blue/green, redirect traffic to old environment.
+
+11. Containerized App Failing ALB Health Checks
+
+Scenario: ECS task is “unhealthy.”
+
+Question: How to fix?
+
+Answer:
+
+Match ALB health check path with container app route.
+
+Increase health check timeout.
+
+Ensure app listens on correct port inside container.
+
+12. ECS Deployment Fails Due to Resource Constraints
+
+Scenario: Deployment stops with “RESOURCE:MEMORY” error.
+
+Question: Fix?
+
+Answer:
+
+Increase memory parameter in task definition.
+
+Scale up EC2 instances or Fargate task size.
+
+13. Application Logs Not Visible
+
+Scenario: No logs in CloudWatch from ECS container.
+
+Question: How to troubleshoot?
+
+Answer:
+
+Check if log configuration in task definition uses awslogs.
+
+Ensure IAM permissions for CloudWatch logs.
+
+Verify log group exists.
+
+14. ECS Service Draining Tasks Too Fast
+
+Scenario: During update, tasks are stopped before new ones are healthy.
+
+Question: How to prevent downtime?
+
+Answer:
+
+Increase deregistrationDelay.timeoutSeconds in target group.
+
+Adjust ECS service deployment configuration.
+
+15. Canary Deployment for Containerized App
+
+Scenario: Deploy new version to 10% of traffic, then full rollout.
+
+Question: How?
+
+Answer:
+
+Use ALB weighted target groups.
+
+Deploy two ECS services, one for old, one for new version.
+
+Adjust weight gradually via Route 53 or ALB rules.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Shell Scripting Real-Time Scenarios
+In terms of DevOps engineer interviews, it is always preferable to practise with some real-world scenarios. Here are some real-world scenarios for you to play with.  
+
+Create a shell script function to locate and terminate all zombie processes. 
+Shell script to gracefully unmount a disk. 
+Shell script to monitor CPU, Memory, and Disc consumption and write the results to a file in table format, as well as issue an alert if any of these exceeds a particular threshold. 
+Shell script to discover the names and sizes of newly generated files. The number of days should be accepted as input. As inputs, you might use a from and to date format. 
+Create a shell script to automate the process of generating new user accounts and configuring their permissions and SSH access on a Linux server. 
+Write a shell script to the list of users who have logged in by date to an output file. 
+Shell script for recursively copying files to distant hosts 
+The number of failed logins attempts by IP address and location is displayed using a shell script. 
+A shell script parses a log file and writes a value with a timestamp to an output file. 
+To save disc space, create a shell script that automates the process of rotating log files and compressing outdated data. 
+Create a shell script that checks the status of a set of URLs and sends an email if any of them are unavailable. 
+Create a shell script to automate the process of applying the latest security updates to a list of servers. 
+Shell Scripting DevOps Interview Questions
+The shell scripting DevOps interview questions vary for each organization. 
+
+A service-based organization, for example, would be only interested in your fundamental Linux and shell scripting knowledge. A product-based corporation, on the other hand, may require a solid understanding of the Linux command line and shell scripting. 
+
+How does shell scripting fit into the overall DevOps workflow? 
+What is the point of using shell scripts when there are automation solutions available? 
+How would you go about building a shell script to automate a specific task? 
+How do I perform static analysis on a Shell script? 
+How can you verify that shell scripts in your CI/CD pipeline are error-free? 
+In shell scripts, how do you handle failures and exceptions? 
+Find all the IP addresses in a log file and save them to another file. 
+How would you troubleshoot a shell script that isn’t operating properly? 
+In shell scripting, what is the difference between a “for” loop and a “while” loop? 
+What exactly is shell scripting, and why is it so important in the context of DevOps? 
+What are shell scripting environment variables, and how can they help with DevOps automation? 
+In shell scripting, explain the difference between single quotes (‘ ‘) and double quotations (” “) and give an example of when to use each. 
+Explanation of the importance of exit codes in shell scripts. What is the standard way to indicate success or failure in a script? 
+In shell scripting, what is the purpose of input and output redirection? Give examples of when you would use > and >>. 
+How can the output of a command be captured and stored in a variable in a shell script?
+ 
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+ 
+
