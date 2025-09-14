@@ -15,6 +15,27 @@ aws ec2 associate-iam-instance-profile \
     --iam-instance-profile Name=EC2S3AccessProfile
 ---------------------------------------------------------------------------
 
+
+📌 Final list for your project (mandatory Jenkins credentials):
+
+github_pat_or_ssh_key → for code repo access
+
+dockerhub_or_artifactory_creds → for pushing images
+
+sonarqube_token → for code quality scans
+
+slack_webhook → for notifications
+
+But what about AWS ECR?
+
+If you use AWS ECR, you don’t need to store creds.
+
+Jenkins (running on EC2 with an IAM Role) can run:
+
+aws ecr get-login-password --region <region> | docker login --username AWS --password-stdin <account_id>.dkr.ecr.<region>.amazonaws.com
+
+----------------------------------------------------------
+
 app-only deployment package you can drop into your repo and run from Jenkins (no Terraform in the app pipeline). This covers create/update flows, auto-discovering the ECS cluster (prefix my-ecscluster-), robust rollback to the last known good task-definition, SecretsManager-based DB access (ECS handles it), and CloudWatch logging & smoke test. I’ll include:
 	•	a production-ready Jenkinsfile (AWS CLI + jq)
 	•	a safe ecs-task-def.json template (keeps secrets in place)
