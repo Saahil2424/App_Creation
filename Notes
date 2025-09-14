@@ -1,3 +1,20 @@
+If we create role using console and attach it to ec2 it automatically created instance profile but if we created role through cli and ec2 instance using cli 
+and if we want to attach this role to ec2 we need to create instance profile manually.
+Basically instance profile is container that makes iam role attachable to instance.
+# Create instance profile
+aws iam create-instance-profile --instance-profile-name EC2S3AccessProfile
+
+# Add role to instance profile
+aws iam add-role-to-instance-profile \
+    --instance-profile-name EC2S3AccessProfile \
+    --role-name EC2S3AccessRole
+
+# Attach instance profile to EC2
+aws ec2 associate-iam-instance-profile \
+    --instance-id i-1234567890abcdef \
+    --iam-instance-profile Name=EC2S3AccessProfile
+---------------------------------------------------------------------------
+
 app-only deployment package you can drop into your repo and run from Jenkins (no Terraform in the app pipeline). This covers create/update flows, auto-discovering the ECS cluster (prefix my-ecscluster-), robust rollback to the last known good task-definition, SecretsManager-based DB access (ECS handles it), and CloudWatch logging & smoke test. I’ll include:
 	•	a production-ready Jenkinsfile (AWS CLI + jq)
 	•	a safe ecs-task-def.json template (keeps secrets in place)
